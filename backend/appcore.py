@@ -31,7 +31,7 @@ from .tasks import (
     activity_scenes, query_support_friends, activity_once,
     support_brief, trim_support_entry,
     store_shelves, store_buy,
-    item_name,
+    item_name, _to_send_format,
 )
 
 
@@ -938,6 +938,53 @@ def dev_summon_records(account: str, passphrase: str | None = None) -> dict:
         })
 
     return {"count": len(rows), "records": rows}
+
+
+def dev_summon_newbie_preview(account: str, passphrase: str | None = None,
+                              confirm_probe: bool = False) -> dict:
+    """开发者模式：对 SummonNewbie 发送一次预览/重抽探测请求。
+
+    只有 confirm_probe=True 才会真正发送请求。请求沿用已实测的招募
+    StoreHandler.BuyCommodity 结构，Count=1；不会调用任何额外“确认招募”route。
+    该操作预期等同于游戏内多按一次预览/重新招募，会令 SummonNewbie.BuyCount 增加。
+    """
+    if not config.check_dev_pass(passphrase):
+        raise ApiError(403, "开发者模式未解锁")
+    if confirm_probe is not True:
+        raise ApiError(400, "必须显式传 confirmProbe=true 才会执行一次篩選招募预览探测")
+
+    acc = _require(account)
+    state = acc.client.account_state or {}
+    records = ((state.get("StoreRecordContainer") or {}).get("Records") or [])
+    rec = next(
+        (
+            r for r in records
+            if isinstance(r, dict)
+            and r.get("Store") == "Summon"
+            and r.get("StaticID") == "SummonNewbie"
+        ),
+        None,
+    )
+    if rec is None:
+        raise ApiError(404, "当前账号快照找不到 Summon/SummonNewbie")
+
+    data = {
+        "Record": _to_send_format(rec),
+        "Count": 1,
+        "ItemIndex": -1,
+        "Platform": "WebGLPlayer",
+        "LoginType": "Erolabs",
+        "NewErolabs": 0,
+        "SelectRoleID": "",
+        "SelcetCostItemID": "",
+    }
+    return dev_call(
+        account,
+        "StoreHandler.BuyCommodity",
+        data,
+        True,
+        passphrase,
+    )
 
 
 def dev_call(account: str, route: str, data: dict | None, use_auth: bool = True,
