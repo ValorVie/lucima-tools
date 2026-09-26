@@ -940,10 +940,53 @@ def dev_summon_records(account: str, passphrase: str | None = None) -> dict:
     return {"count": len(rows), "records": rows}
 
 
+def dev_summon_newbie_confirm(account: str, record_number: int,
+                               confirm_claim: bool = False,
+                               passphrase: str | None = None) -> dict:
+    """开发者模式：领取一笔已经生成的 SummonNewbie 篩選招募结果。
+
+    实抓确认 route：
+      SelectiveSummonRecordHandler.DropSummonRecord
+      {CommodityID: "SummonNewbie", RecordNumber: N, AID, SessionID}
+
+    为避免误领，必须显式传 confirmClaim=true。
+    """
+    if not config.check_dev_pass(passphrase):
+        raise ApiError(403, "开发者模式未解锁")
+    if confirm_claim is not True:
+        raise ApiError(400, "必须显式传 confirmClaim=true 才会确认招募")
+    try:
+        record_number = int(record_number)
+    except (TypeError, ValueError):
+        raise ApiError(400, "recordNumber 必须是整数")
+    if record_number < 0:
+        raise ApiError(400, "recordNumber 不能小于 0")
+
+    acc = _require(account)
+    with acc.lock:
+        try:
+            res = acc.client.call(
+                "SelectiveSummonRecordHandler.DropSummonRecord",
+                acc.client._auth_data({
+                    "CommodityID": "SummonNewbie",
+                    "RecordNumber": record_number,
+                }),
+            )
+        except Exception as error:
+            return {"ok": False, "confirmed": False, "error": str(error)}
+    return {
+        "ok": True,
+        "confirmed": True,
+        "recordNumber": record_number,
+        "raw": res,
+    }
+
+
 def dev_summon_newbie_reroll(account: str, target_role_ids: list | None,
                               require_all: bool = True, max_rolls: int = 500,
+                              confirm_on_match: bool = False,
                               passphrase: str | None = None) -> dict:
-    """开发者模式：自动重抽 SummonNewbie，命中目标后停止，不执行最终确认招募。
+    """开发者模式：自动重抽 SummonNewbie，命中目标后可选择立即确认招募。
 
     target_role_ids 只匹配角色 StaticID（例如 H005）；神器不参与判定。
     require_all=True 表示全部目标都出现；False 表示任一目标出现。
@@ -1051,13 +1094,51 @@ def dev_summon_newbie_reroll(account: str, target_role_ids: list | None,
             history.append(row)
 
             if matched:
+                confirmed = False
+                confirm_result = None
+                if confirm_on_match:
+                    record_number = parsed.get("recordNumber")
+                    if record_number is None:
+                        return {
+                            "ok": False,
+                            "matched": True,
+                            "confirmed": False,
+                            "rolls": n,
+                            "targets": sorted(targets),
+                            "requireAll": bool(require_all),
+                            "result": row,
+                            "error": "命中目标，但响应缺少 SelectiveSummonRecord.RecordNumber，未执行确认",
+                        }
+                    try:
+                        confirm_result = c.call(
+                            "SelectiveSummonRecordHandler.DropSummonRecord",
+                            c._auth_data({
+                                "CommodityID": "SummonNewbie",
+                                "RecordNumber": int(record_number),
+                            }),
+                        )
+                        confirmed = True
+                    except Exception as error:
+                        return {
+                            "ok": False,
+                            "matched": True,
+                            "confirmed": False,
+                            "rolls": n,
+                            "targets": sorted(targets),
+                            "requireAll": bool(require_all),
+                            "result": row,
+                            "error": f"命中目标但确认招募失败：{error}",
+                        }
+
                 return {
                     "ok": True,
                     "matched": True,
+                    "confirmed": confirmed,
                     "rolls": n,
                     "targets": sorted(targets),
                     "requireAll": bool(require_all),
                     "result": row,
+                    "confirmRaw": confirm_result,
                 }
 
     return {
