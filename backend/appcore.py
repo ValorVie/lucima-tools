@@ -9,12 +9,14 @@ from __future__ import annotations
 import json
 import os
 import threading
+import time
+import random
 from pathlib import Path
 
 from . import config
 from . import accounts
 from .logutil import log
-from .game_client import GameClient, GameError
+from .game_client import GameClient, GameError, GameMessage
 from .portal import (
     PortalError, access_token_expires_at, access_token_needs_refresh,
     portal_login_v2, portal_refresh_v2,
@@ -31,7 +33,7 @@ from .tasks import (
     activity_scenes, query_support_friends, activity_once,
     support_brief, trim_support_entry,
     store_shelves, store_buy,
-    item_name,
+    item_name, _to_send_format,
 )
 
 
@@ -903,6 +905,383 @@ def dev_request_history(account: str, passphrase: str | None = None) -> dict:
     acc = _require(account)
     getter = getattr(acc.client, "recent_requests", None)
     return {"history": getter(5) if callable(getter) else []}
+
+
+def dev_summon_records(account: str, passphrase: str | None = None) -> dict:
+    """开发者模式：列出当前登录快照中所有招募相关货架记录。
+
+    只读取本地 account_state，不向游戏后端发送请求。用于确认筛选招募等特殊池的
+    Store / StaticID / SummonRoleID(S) 结构，避免在协议尚未确认前误触实际招募。
+    """
+    if not config.check_dev_pass(passphrase):
+        raise ApiError(403, "开发者模式未解锁")
+    acc = _require(account)
+    state = acc.client.account_state or {}
+    records = ((state.get("StoreRecordContainer") or {}).get("Records") or [])
+
+    rows = []
+    for index, rec in enumerate(records):
+        if not isinstance(rec, dict):
+            continue
+        store = str(rec.get("Store") or "")
+        has_summon_fields = "SummonRoleID" in rec or "SummonRoleIDs" in rec
+        if "summon" not in store.lower() and not has_summon_fields:
+            continue
+        rows.append({
+            "index": index,
+            "store": rec.get("Store"),
+            "staticID": rec.get("StaticID"),
+            "buyCount": rec.get("BuyCount"),
+            "freeBuyCount": rec.get("FreeBuyCount"),
+            "guaranteedCount": rec.get("GuaranteedCount"),
+            "summonRoleID": rec.get("SummonRoleID"),
+            "summonRoleIDs": rec.get("SummonRoleIDs"),
+            "record": rec,
+        })
+
+    return {"count": len(rows), "records": rows}
+
+
+def dev_summon_newbie_confirm(account: str, record_number: int,
+                               confirm_claim: bool = False,
+                               passphrase: str | None = None) -> dict:
+    """开发者模式：领取一笔已经生成的 SummonNewbie 篩選招募结果。
+
+    实抓确认 route：
+      SelectiveSummonRecordHandler.DropSummonRecord
+      {CommodityID: "SummonNewbie", RecordNumber: N, AID, SessionID}
+
+    为避免误领，必须显式传 confirmClaim=true。
+    """
+    if not config.check_dev_pass(passphrase):
+        raise ApiError(403, "开发者模式未解锁")
+    if confirm_claim is not True:
+        raise ApiError(400, "必须显式传 confirmClaim=true 才会确认招募")
+    try:
+        record_number = int(record_number)
+    except (TypeError, ValueError):
+        raise ApiError(400, "recordNumber 必须是整数")
+    if record_number < 0:
+        raise ApiError(400, "recordNumber 不能小于 0")
+
+    acc = _require(account)
+    with acc.lock:
+        try:
+            res = acc.client.call(
+                "SelectiveSummonRecordHandler.DropSummonRecord",
+                acc.client._auth_data({
+                    "CommodityID": "SummonNewbie",
+                    "RecordNumber": record_number,
+                }),
+            )
+        except Exception as error:
+            return {"ok": False, "confirmed": False, "error": str(error)}
+    return {
+        "ok": True,
+        "confirmed": True,
+        "recordNumber": record_number,
+        "raw": res,
+    }
+
+
+def dev_summon_newbie_reroll(account: str, target_role_ids: list | None,
+                              require_all: bool = True, max_rolls: int = 500,
+                              confirm_on_match: bool = False,
+                              interval_min_ms: int = 20000,
+                              interval_max_ms: int = 30000,
+                              rate_limit_backoff_ms: int = 10000,
+                              passphrase: str | None = None) -> dict:
+    """开发者模式：自动重抽 SummonNewbie，命中目标后可选择立即确认招募。
+
+    target_role_ids 只匹配角色 StaticID（例如 H005）；神器不参与判定。
+    require_all=True 表示全部目标都出现；False 表示任一目标出现。
+    max_rolls 是安全上限，避免误配置时无限循环。
+    """
+    if not config.check_dev_pass(passphrase):
+        raise ApiError(403, "开发者模式未解锁")
+
+    targets = {str(x).strip() for x in (target_role_ids or []) if str(x).strip()}
+    if not targets:
+        raise ApiError(400, "targetRoleIDs 不能为空")
+
+    try:
+        max_rolls = int(max_rolls)
+    except (TypeError, ValueError):
+        raise ApiError(400, "maxRolls 必须是整数")
+    if max_rolls < 1 or max_rolls > 5000:
+        raise ApiError(400, "maxRolls 必须介于 1~5000")
+
+    try:
+        interval_min_ms = int(interval_min_ms)
+        interval_max_ms = int(interval_max_ms)
+        rate_limit_backoff_ms = int(rate_limit_backoff_ms)
+    except (TypeError, ValueError):
+        raise ApiError(400, "intervalMinMs / intervalMaxMs / rateLimitBackoffMs 必须是整数")
+    if interval_min_ms < 0 or interval_min_ms > 120000:
+        raise ApiError(400, "intervalMinMs 必须介于 0~120000")
+    if interval_max_ms < interval_min_ms or interval_max_ms > 120000:
+        raise ApiError(400, "intervalMaxMs 必须 >= intervalMinMs 且 <= 120000")
+    if rate_limit_backoff_ms < 1000 or rate_limit_backoff_ms > 120000:
+        raise ApiError(400, "rateLimitBackoffMs 必须介于 1000~120000")
+
+    acc = _require(account)
+    c = acc.client
+    history = []
+    target_hits = {sid: 0 for sid in sorted(targets)}
+    all_target_hits = 0
+
+    def current_record():
+        records = (((c.account_state or {}).get("StoreRecordContainer") or {}).get("Records") or [])
+        return next(
+            (
+                r for r in records
+                if isinstance(r, dict)
+                and r.get("Store") == "Summon"
+                and r.get("StaticID") == "SummonNewbie"
+            ),
+            None,
+        )
+
+    def parse_result(res: dict) -> dict:
+        selective = res.get("SelectiveSummonRecord") or {}
+        drop = selective.get("NowDropResult") or {}
+        items = drop.get("Items") or []
+        roles = []
+        artifacts = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            role = item.get("RoleData")
+            if isinstance(role, dict):
+                sid = str(role.get("StaticID") or "")
+                roles.append({
+                    "id": sid,
+                    "name": item_name(sid),
+                    "star": role.get("Star"),
+                })
+                continue
+            artifact = item.get("Artifact")
+            if isinstance(artifact, dict):
+                sid = str(artifact.get("StaticID") or "")
+                artifacts.append({
+                    "id": sid,
+                    "name": item_name(sid),
+                })
+        return {
+            "roles": roles,
+            "artifacts": artifacts,
+            "recordNumber": selective.get("RecordNumber"),
+            "rewarded": selective.get("Rewarded"),
+        }
+
+    with acc.lock:
+        for n in range(1, max_rolls + 1):
+            if n > 1 and interval_max_ms:
+                delay_ms = random.randint(interval_min_ms, interval_max_ms)
+                log.info("[reroll] 第 %d 抽前等待 %.1f 秒", n, delay_ms / 1000.0)
+                time.sleep(delay_ms / 1000.0)
+
+            rec = current_record()
+            if rec is None:
+                raise ApiError(404, "当前账号快照找不到 Summon/SummonNewbie")
+
+            payload = {
+                "Record": _to_send_format(rec),
+                "Count": 1,
+                "ItemIndex": -1,
+                "Platform": "WebGLPlayer",
+                "LoginType": "Erolabs",
+                "NewErolabs": 0,
+                "SelectRoleID": "",
+                "SelcetCostItemID": "",
+            }
+            rate_limit_retries = 0
+            while True:
+                try:
+                    res = c.call("StoreHandler.BuyCommodity", c._auth_data(payload))
+                    break
+                except GameMessage as error:
+                    if "too many account requests" not in error.msg.lower():
+                        return {
+                            "ok": False,
+                            "matched": False,
+                            "rolls": n - 1,
+                            "error": error.msg,
+                            "last": history[-1] if history else None,
+                        }
+                    rate_limit_retries += 1
+                    if rate_limit_retries > 5:
+                        return {
+                            "ok": False,
+                            "matched": False,
+                            "rolls": n - 1,
+                            "rateLimited": True,
+                            "error": "连续触发账号请求频率限制，已停止",
+                            "last": history[-1] if history else None,
+                        }
+                    # 尊重服务器的账号级频率限制：退避后重试同一抽，不计入抽数。
+                    backoff = (rate_limit_backoff_ms / 1000.0) * rate_limit_retries
+                    time.sleep(backoff)
+                except Exception as error:
+                    return {
+                        "ok": False,
+                        "matched": False,
+                        "rolls": n - 1,
+                        "error": str(error),
+                        "last": history[-1] if history else None,
+                    }
+
+            parsed = parse_result(res)
+            role_ids = {r["id"] for r in parsed["roles"] if r["id"]}
+            matched = targets <= role_ids if require_all else bool(targets & role_ids)
+
+            for sid in target_hits:
+                if sid in role_ids:
+                    target_hits[sid] += 1
+            all_present = targets <= role_ids
+            if all_present:
+                all_target_hits += 1
+
+            five_stars = [
+                f'{r["id"]}({r["name"]})'
+                for r in parsed["roles"]
+                if r.get("star") == 5
+            ]
+            five_star_text = ", ".join(five_stars) if five_stars else "none"
+            presence_text = " ".join(
+                f'{sid}={"yes" if sid in role_ids else "no"}'
+                for sid in sorted(targets)
+            )
+            cumulative_text = " ".join(
+                f'{sid}={target_hits[sid]}'
+                for sid in sorted(targets)
+            )
+            log.info(
+                "[reroll] #%d 5★=%s | %s | 累计 %s 同时=%d/%d",
+                n, five_star_text, presence_text, cumulative_text, all_target_hits, n,
+            )
+
+            row = {
+                "roll": n,
+                "buyCount": (res.get("CommodityRecord") or {}).get("BuyCount"),
+                **parsed,
+                "matched": matched,
+            }
+            history.append(row)
+
+            if matched:
+                confirmed = False
+                confirm_result = None
+                if confirm_on_match:
+                    record_number = parsed.get("recordNumber")
+                    if record_number is None:
+                        return {
+                            "ok": False,
+                            "matched": True,
+                            "confirmed": False,
+                            "rolls": n,
+                            "targets": sorted(targets),
+                            "requireAll": bool(require_all),
+                            "result": row,
+                            "error": "命中目标，但响应缺少 SelectiveSummonRecord.RecordNumber，未执行确认",
+                        }
+                    try:
+                        confirm_result = c.call(
+                            "SelectiveSummonRecordHandler.DropSummonRecord",
+                            c._auth_data({
+                                "CommodityID": "SummonNewbie",
+                                "RecordNumber": int(record_number),
+                            }),
+                        )
+                        confirmed = True
+                    except Exception as error:
+                        return {
+                            "ok": False,
+                            "matched": True,
+                            "confirmed": False,
+                            "rolls": n,
+                            "targets": sorted(targets),
+                            "requireAll": bool(require_all),
+                            "result": row,
+                            "error": f"命中目标但确认招募失败：{error}",
+                        }
+
+                return {
+                    "ok": True,
+                    "matched": True,
+                    "confirmed": confirmed,
+                    "rolls": n,
+                    "targets": sorted(targets),
+                    "requireAll": bool(require_all),
+                    "result": row,
+                    "stats": {
+                        "targetHits": target_hits,
+                        "allTargetHits": all_target_hits,
+                        "rolls": n,
+                    },
+                    "confirmRaw": confirm_result,
+                }
+
+    return {
+        "ok": True,
+        "matched": False,
+        "rolls": max_rolls,
+        "targets": sorted(targets),
+        "requireAll": bool(require_all),
+        "result": history[-1] if history else None,
+        "stats": {
+            "targetHits": target_hits,
+            "allTargetHits": all_target_hits,
+            "rolls": max_rolls,
+        },
+    }
+
+
+def dev_summon_newbie_preview(account: str, passphrase: str | None = None,
+                              confirm_probe: bool = False) -> dict:
+    """开发者模式：对 SummonNewbie 发送一次预览/重抽探测请求。
+
+    只有 confirm_probe=True 才会真正发送请求。请求沿用已实测的招募
+    StoreHandler.BuyCommodity 结构，Count=1；不会调用任何额外“确认招募”route。
+    该操作预期等同于游戏内多按一次预览/重新招募，会令 SummonNewbie.BuyCount 增加。
+    """
+    if not config.check_dev_pass(passphrase):
+        raise ApiError(403, "开发者模式未解锁")
+    if confirm_probe is not True:
+        raise ApiError(400, "必须显式传 confirmProbe=true 才会执行一次篩選招募预览探测")
+
+    acc = _require(account)
+    state = acc.client.account_state or {}
+    records = ((state.get("StoreRecordContainer") or {}).get("Records") or [])
+    rec = next(
+        (
+            r for r in records
+            if isinstance(r, dict)
+            and r.get("Store") == "Summon"
+            and r.get("StaticID") == "SummonNewbie"
+        ),
+        None,
+    )
+    if rec is None:
+        raise ApiError(404, "当前账号快照找不到 Summon/SummonNewbie")
+
+    data = {
+        "Record": _to_send_format(rec),
+        "Count": 1,
+        "ItemIndex": -1,
+        "Platform": "WebGLPlayer",
+        "LoginType": "Erolabs",
+        "NewErolabs": 0,
+        "SelectRoleID": "",
+        "SelcetCostItemID": "",
+    }
+    return dev_call(
+        account,
+        "StoreHandler.BuyCommodity",
+        data,
+        True,
+        passphrase,
+    )
 
 
 def dev_call(account: str, route: str, data: dict | None, use_auth: bool = True,
