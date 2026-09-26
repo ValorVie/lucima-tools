@@ -10,6 +10,7 @@ import json
 import os
 import threading
 import time
+import random
 from pathlib import Path
 
 from . import config
@@ -986,8 +987,9 @@ def dev_summon_newbie_confirm(account: str, record_number: int,
 def dev_summon_newbie_reroll(account: str, target_role_ids: list | None,
                               require_all: bool = True, max_rolls: int = 500,
                               confirm_on_match: bool = False,
-                              interval_ms: int = 1500,
-                              rate_limit_backoff_ms: int = 5000,
+                              interval_min_ms: int = 20000,
+                              interval_max_ms: int = 30000,
+                              rate_limit_backoff_ms: int = 10000,
                               passphrase: str | None = None) -> dict:
     """开发者模式：自动重抽 SummonNewbie，命中目标后可选择立即确认招募。
 
@@ -1010,12 +1012,15 @@ def dev_summon_newbie_reroll(account: str, target_role_ids: list | None,
         raise ApiError(400, "maxRolls 必须介于 1~5000")
 
     try:
-        interval_ms = int(interval_ms)
+        interval_min_ms = int(interval_min_ms)
+        interval_max_ms = int(interval_max_ms)
         rate_limit_backoff_ms = int(rate_limit_backoff_ms)
     except (TypeError, ValueError):
-        raise ApiError(400, "intervalMs / rateLimitBackoffMs 必须是整数")
-    if interval_ms < 0 or interval_ms > 60000:
-        raise ApiError(400, "intervalMs 必须介于 0~60000")
+        raise ApiError(400, "intervalMinMs / intervalMaxMs / rateLimitBackoffMs 必须是整数")
+    if interval_min_ms < 0 or interval_min_ms > 120000:
+        raise ApiError(400, "intervalMinMs 必须介于 0~120000")
+    if interval_max_ms < interval_min_ms or interval_max_ms > 120000:
+        raise ApiError(400, "intervalMaxMs 必须 >= intervalMinMs 且 <= 120000")
     if rate_limit_backoff_ms < 1000 or rate_limit_backoff_ms > 120000:
         raise ApiError(400, "rateLimitBackoffMs 必须介于 1000~120000")
 
@@ -1069,8 +1074,10 @@ def dev_summon_newbie_reroll(account: str, target_role_ids: list | None,
 
     with acc.lock:
         for n in range(1, max_rolls + 1):
-            if n > 1 and interval_ms:
-                time.sleep(interval_ms / 1000.0)
+            if n > 1 and interval_max_ms:
+                delay_ms = random.randint(interval_min_ms, interval_max_ms)
+                log.info("[reroll] 第 %d 抽前等待 %.1f 秒", n, delay_ms / 1000.0)
+                time.sleep(delay_ms / 1000.0)
 
             rec = current_record()
             if rec is None:
