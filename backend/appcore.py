@@ -940,6 +940,136 @@ def dev_summon_records(account: str, passphrase: str | None = None) -> dict:
     return {"count": len(rows), "records": rows}
 
 
+def dev_summon_newbie_reroll(account: str, target_role_ids: list | None,
+                              require_all: bool = True, max_rolls: int = 500,
+                              passphrase: str | None = None) -> dict:
+    """开发者模式：自动重抽 SummonNewbie，命中目标后停止，不执行最终确认招募。
+
+    target_role_ids 只匹配角色 StaticID（例如 H005）；神器不参与判定。
+    require_all=True 表示全部目标都出现；False 表示任一目标出现。
+    max_rolls 是安全上限，避免误配置时无限循环。
+    """
+    if not config.check_dev_pass(passphrase):
+        raise ApiError(403, "开发者模式未解锁")
+
+    targets = {str(x).strip() for x in (target_role_ids or []) if str(x).strip()}
+    if not targets:
+        raise ApiError(400, "targetRoleIDs 不能为空")
+
+    try:
+        max_rolls = int(max_rolls)
+    except (TypeError, ValueError):
+        raise ApiError(400, "maxRolls 必须是整数")
+    if max_rolls < 1 or max_rolls > 5000:
+        raise ApiError(400, "maxRolls 必须介于 1~5000")
+
+    acc = _require(account)
+    c = acc.client
+    history = []
+
+    def current_record():
+        records = (((c.account_state or {}).get("StoreRecordContainer") or {}).get("Records") or [])
+        return next(
+            (
+                r for r in records
+                if isinstance(r, dict)
+                and r.get("Store") == "Summon"
+                and r.get("StaticID") == "SummonNewbie"
+            ),
+            None,
+        )
+
+    def parse_result(res: dict) -> dict:
+        selective = res.get("SelectiveSummonRecord") or {}
+        drop = selective.get("NowDropResult") or {}
+        items = drop.get("Items") or []
+        roles = []
+        artifacts = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            role = item.get("RoleData")
+            if isinstance(role, dict):
+                sid = str(role.get("StaticID") or "")
+                roles.append({
+                    "id": sid,
+                    "name": item_name(sid),
+                    "star": role.get("Star"),
+                })
+                continue
+            artifact = item.get("Artifact")
+            if isinstance(artifact, dict):
+                sid = str(artifact.get("StaticID") or "")
+                artifacts.append({
+                    "id": sid,
+                    "name": item_name(sid),
+                })
+        return {
+            "roles": roles,
+            "artifacts": artifacts,
+            "recordNumber": selective.get("RecordNumber"),
+            "rewarded": selective.get("Rewarded"),
+        }
+
+    with acc.lock:
+        for n in range(1, max_rolls + 1):
+            rec = current_record()
+            if rec is None:
+                raise ApiError(404, "当前账号快照找不到 Summon/SummonNewbie")
+
+            payload = {
+                "Record": _to_send_format(rec),
+                "Count": 1,
+                "ItemIndex": -1,
+                "Platform": "WebGLPlayer",
+                "LoginType": "Erolabs",
+                "NewErolabs": 0,
+                "SelectRoleID": "",
+                "SelcetCostItemID": "",
+            }
+            try:
+                res = c.call("StoreHandler.BuyCommodity", c._auth_data(payload))
+            except Exception as error:
+                return {
+                    "ok": False,
+                    "matched": False,
+                    "rolls": n - 1,
+                    "error": str(error),
+                    "last": history[-1] if history else None,
+                }
+
+            parsed = parse_result(res)
+            role_ids = {r["id"] for r in parsed["roles"] if r["id"]}
+            matched = targets <= role_ids if require_all else bool(targets & role_ids)
+
+            row = {
+                "roll": n,
+                "buyCount": (res.get("CommodityRecord") or {}).get("BuyCount"),
+                **parsed,
+                "matched": matched,
+            }
+            history.append(row)
+
+            if matched:
+                return {
+                    "ok": True,
+                    "matched": True,
+                    "rolls": n,
+                    "targets": sorted(targets),
+                    "requireAll": bool(require_all),
+                    "result": row,
+                }
+
+    return {
+        "ok": True,
+        "matched": False,
+        "rolls": max_rolls,
+        "targets": sorted(targets),
+        "requireAll": bool(require_all),
+        "result": history[-1] if history else None,
+    }
+
+
 def dev_summon_newbie_preview(account: str, passphrase: str | None = None,
                               confirm_probe: bool = False) -> dict:
     """开发者模式：对 SummonNewbie 发送一次预览/重抽探测请求。
