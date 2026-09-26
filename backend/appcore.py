@@ -1027,6 +1027,8 @@ def dev_summon_newbie_reroll(account: str, target_role_ids: list | None,
     acc = _require(account)
     c = acc.client
     history = []
+    target_hits = {sid: 0 for sid in sorted(targets)}
+    all_target_hits = 0
 
     def current_record():
         records = (((c.account_state or {}).get("StoreRecordContainer") or {}).get("Records") or [])
@@ -1133,6 +1135,32 @@ def dev_summon_newbie_reroll(account: str, target_role_ids: list | None,
             role_ids = {r["id"] for r in parsed["roles"] if r["id"]}
             matched = targets <= role_ids if require_all else bool(targets & role_ids)
 
+            for sid in target_hits:
+                if sid in role_ids:
+                    target_hits[sid] += 1
+            all_present = targets <= role_ids
+            if all_present:
+                all_target_hits += 1
+
+            five_stars = [
+                f'{r["id"]}({r["name"]})'
+                for r in parsed["roles"]
+                if r.get("star") == 5
+            ]
+            five_star_text = ", ".join(five_stars) if five_stars else "none"
+            presence_text = " ".join(
+                f'{sid}={"yes" if sid in role_ids else "no"}'
+                for sid in sorted(targets)
+            )
+            cumulative_text = " ".join(
+                f'{sid}={target_hits[sid]}'
+                for sid in sorted(targets)
+            )
+            log.info(
+                "[reroll] #%d 5★=%s | %s | 累计 %s 同时=%d/%d",
+                n, five_star_text, presence_text, cumulative_text, all_target_hits, n,
+            )
+
             row = {
                 "roll": n,
                 "buyCount": (res.get("CommodityRecord") or {}).get("BuyCount"),
@@ -1186,6 +1214,11 @@ def dev_summon_newbie_reroll(account: str, target_role_ids: list | None,
                     "targets": sorted(targets),
                     "requireAll": bool(require_all),
                     "result": row,
+                    "stats": {
+                        "targetHits": target_hits,
+                        "allTargetHits": all_target_hits,
+                        "rolls": n,
+                    },
                     "confirmRaw": confirm_result,
                 }
 
@@ -1196,6 +1229,11 @@ def dev_summon_newbie_reroll(account: str, target_role_ids: list | None,
         "targets": sorted(targets),
         "requireAll": bool(require_all),
         "result": history[-1] if history else None,
+        "stats": {
+            "targetHits": target_hits,
+            "allTargetHits": all_target_hits,
+            "rolls": max_rolls,
+        },
     }
 
 
