@@ -122,12 +122,20 @@ def _route_api(method: str, path: str, body: dict, query: dict) -> dict:
                 body.get("pass"),
                 body.get("confirmProbe") is True,
             )
+        if path == "/api/dev/summon-newbie-confirm":
+            return appcore.dev_summon_newbie_confirm(
+                body.get("account"),
+                body.get("recordNumber"),
+                body.get("confirmClaim") is True,
+                body.get("pass"),
+            )
         if path == "/api/dev/summon-newbie-reroll":
             return appcore.dev_summon_newbie_reroll(
                 body.get("account"),
                 body.get("targetRoleIDs"),
                 body.get("requireAll", True) is True,
                 body.get("maxRolls", 500),
+                body.get("confirmOnMatch") is True,
                 body.get("pass"),
             )
         if path == "/api/dev/call":
