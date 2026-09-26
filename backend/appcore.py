@@ -9,12 +9,13 @@ from __future__ import annotations
 import json
 import os
 import threading
+import time
 from pathlib import Path
 
 from . import config
 from . import accounts
 from .logutil import log
-from .game_client import GameClient, GameError
+from .game_client import GameClient, GameError, GameMessage
 from .portal import (
     PortalError, access_token_expires_at, access_token_needs_refresh,
     portal_login_v2, portal_refresh_v2,
@@ -985,6 +986,8 @@ def dev_summon_newbie_confirm(account: str, record_number: int,
 def dev_summon_newbie_reroll(account: str, target_role_ids: list | None,
                               require_all: bool = True, max_rolls: int = 500,
                               confirm_on_match: bool = False,
+                              interval_ms: int = 1500,
+                              rate_limit_backoff_ms: int = 5000,
                               passphrase: str | None = None) -> dict:
     """开发者模式：自动重抽 SummonNewbie，命中目标后可选择立即确认招募。
 
@@ -1005,6 +1008,16 @@ def dev_summon_newbie_reroll(account: str, target_role_ids: list | None,
         raise ApiError(400, "maxRolls 必须是整数")
     if max_rolls < 1 or max_rolls > 5000:
         raise ApiError(400, "maxRolls 必须介于 1~5000")
+
+    try:
+        interval_ms = int(interval_ms)
+        rate_limit_backoff_ms = int(rate_limit_backoff_ms)
+    except (TypeError, ValueError):
+        raise ApiError(400, "intervalMs / rateLimitBackoffMs 必须是整数")
+    if interval_ms < 0 or interval_ms > 60000:
+        raise ApiError(400, "intervalMs 必须介于 0~60000")
+    if rate_limit_backoff_ms < 1000 or rate_limit_backoff_ms > 120000:
+        raise ApiError(400, "rateLimitBackoffMs 必须介于 1000~120000")
 
     acc = _require(account)
     c = acc.client
@@ -1056,6 +1069,9 @@ def dev_summon_newbie_reroll(account: str, target_role_ids: list | None,
 
     with acc.lock:
         for n in range(1, max_rolls + 1):
+            if n > 1 and interval_ms:
+                time.sleep(interval_ms / 1000.0)
+
             rec = current_record()
             if rec is None:
                 raise ApiError(404, "当前账号快照找不到 Summon/SummonNewbie")
@@ -1070,16 +1086,41 @@ def dev_summon_newbie_reroll(account: str, target_role_ids: list | None,
                 "SelectRoleID": "",
                 "SelcetCostItemID": "",
             }
-            try:
-                res = c.call("StoreHandler.BuyCommodity", c._auth_data(payload))
-            except Exception as error:
-                return {
-                    "ok": False,
-                    "matched": False,
-                    "rolls": n - 1,
-                    "error": str(error),
-                    "last": history[-1] if history else None,
-                }
+            rate_limit_retries = 0
+            while True:
+                try:
+                    res = c.call("StoreHandler.BuyCommodity", c._auth_data(payload))
+                    break
+                except GameMessage as error:
+                    if "too many account requests" not in error.msg.lower():
+                        return {
+                            "ok": False,
+                            "matched": False,
+                            "rolls": n - 1,
+                            "error": error.msg,
+                            "last": history[-1] if history else None,
+                        }
+                    rate_limit_retries += 1
+                    if rate_limit_retries > 5:
+                        return {
+                            "ok": False,
+                            "matched": False,
+                            "rolls": n - 1,
+                            "rateLimited": True,
+                            "error": "连续触发账号请求频率限制，已停止",
+                            "last": history[-1] if history else None,
+                        }
+                    # 尊重服务器的账号级频率限制：退避后重试同一抽，不计入抽数。
+                    backoff = (rate_limit_backoff_ms / 1000.0) * rate_limit_retries
+                    time.sleep(backoff)
+                except Exception as error:
+                    return {
+                        "ok": False,
+                        "matched": False,
+                        "rolls": n - 1,
+                        "error": str(error),
+                        "last": history[-1] if history else None,
+                    }
 
             parsed = parse_result(res)
             role_ids = {r["id"] for r in parsed["roles"] if r["id"]}
