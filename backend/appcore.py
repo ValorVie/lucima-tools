@@ -1173,7 +1173,8 @@ def dev_summon_newbie_reroll(account: str, target_role_ids: list | None,
                 confirmed = False
                 confirm_result = None
                 if confirm_on_match:
-                    record_number = parsed.get("recordNumber")
+                    # The official client confirms with the updated BuyCount, not the preview's RecordNumber.
+                    record_number = row.get("buyCount")
                     if record_number is None:
                         return {
                             "ok": False,
@@ -1183,7 +1184,7 @@ def dev_summon_newbie_reroll(account: str, target_role_ids: list | None,
                             "targets": sorted(targets),
                             "requireAll": bool(require_all),
                             "result": row,
-                            "error": "命中目标，但响应缺少 SelectiveSummonRecord.RecordNumber，未执行确认",
+                            "error": "命中目标，但响应缺少 CommodityRecord.BuyCount，未执行确认",
                         }
                     try:
                         confirm_result = c.call(
