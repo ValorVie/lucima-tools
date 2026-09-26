@@ -905,6 +905,41 @@ def dev_request_history(account: str, passphrase: str | None = None) -> dict:
     return {"history": getter(5) if callable(getter) else []}
 
 
+def dev_summon_records(account: str, passphrase: str | None = None) -> dict:
+    """开发者模式：列出当前登录快照中所有招募相关货架记录。
+
+    只读取本地 account_state，不向游戏后端发送请求。用于确认筛选招募等特殊池的
+    Store / StaticID / SummonRoleID(S) 结构，避免在协议尚未确认前误触实际招募。
+    """
+    if not config.check_dev_pass(passphrase):
+        raise ApiError(403, "开发者模式未解锁")
+    acc = _require(account)
+    state = acc.client.account_state or {}
+    records = ((state.get("StoreRecordContainer") or {}).get("Records") or [])
+
+    rows = []
+    for index, rec in enumerate(records):
+        if not isinstance(rec, dict):
+            continue
+        store = str(rec.get("Store") or "")
+        has_summon_fields = "SummonRoleID" in rec or "SummonRoleIDs" in rec
+        if "summon" not in store.lower() and not has_summon_fields:
+            continue
+        rows.append({
+            "index": index,
+            "store": rec.get("Store"),
+            "staticID": rec.get("StaticID"),
+            "buyCount": rec.get("BuyCount"),
+            "freeBuyCount": rec.get("FreeBuyCount"),
+            "guaranteedCount": rec.get("GuaranteedCount"),
+            "summonRoleID": rec.get("SummonRoleID"),
+            "summonRoleIDs": rec.get("SummonRoleIDs"),
+            "record": rec,
+        })
+
+    return {"count": len(rows), "records": rows}
+
+
 def dev_call(account: str, route: str, data: dict | None, use_auth: bool = True,
              passphrase: str | None = None) -> dict:
     """开发者模式：用该账号的活会话发一条任意 route，回**未加工**的收发报文。
