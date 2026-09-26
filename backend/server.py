@@ -136,8 +136,9 @@ def _route_api(method: str, path: str, body: dict, query: dict) -> dict:
                 body.get("requireAll", True) is True,
                 body.get("maxRolls", 500),
                 body.get("confirmOnMatch") is True,
-                body.get("intervalMs", 1500),
-                body.get("rateLimitBackoffMs", 5000),
+                body.get("intervalMinMs", 20000),
+                body.get("intervalMaxMs", 30000),
+                body.get("rateLimitBackoffMs", 10000),
                 body.get("pass"),
             )
         if path == "/api/dev/call":
