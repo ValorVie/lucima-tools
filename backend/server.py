@@ -114,6 +114,8 @@ def _route_api(method: str, path: str, body: dict, query: dict) -> dict:
             return appcore.dev_unlock(body.get("pass"))
         if path == "/api/dev/history":
             return appcore.dev_request_history(body.get("account"), body.get("pass"))
+        if path == "/api/dev/summon-records":
+            return appcore.dev_summon_records(body.get("account"), body.get("pass"))
         if path == "/api/dev/call":
             # 开发者模式原始协议控制台。门禁在 appcore.dev_call 里验口令
             # （前端隐藏入口不算限制，见 config.DEV_PASSPHRASE 的注释）。
